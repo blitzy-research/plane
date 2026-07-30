@@ -879,14 +879,23 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         # tenants. The lookup is intentionally unguarded because `BaseAPIView.handle_exception`
         # already maps a missing object onto a 404 response. The default manager is used instead of
         # `Issue.issue_objects` so that archived and draft work items remain duplicable, while soft
-        # deleted rows still resolve to a 404 through the soft deletion manager.
-        issue = Issue.objects.get(workspace__slug=slug, project_id=project_id, pk=pk)
+        # deleted rows still resolve to a 404 through the soft deletion manager. The state, the
+        # project and the project's workspace are selected alongside the source because
+        # `Issue.save()` dereferences all three while inserting the clone.
+        issue = Issue.objects.select_related("state", "project__workspace").get(
+            workspace__slug=slug, project_id=project_id, pk=pk
+        )
 
         # Capture the many-to-many membership and the workspace before the instance is mutated
-        # below. Once the primary key is cleared these managers resolve against an empty key and
-        # silently return empty lists, so this ordering is load bearing.
-        assignee_ids = list(issue.assignees.values_list("id", flat=True))
-        label_ids = list(issue.labels.values_list("id", flat=True))
+        # below. Once the primary key is cleared these queries resolve against an empty key and
+        # silently return empty lists, so this ordering is load bearing. The through tables are read
+        # directly instead of through the `assignees` and `labels` managers because those managers
+        # join the through rows without filtering out the soft deleted ones, which would resurrect
+        # associations already removed from the source and could duplicate an association that was
+        # removed and added back. Reading them here also matches exactly what the serializer renders
+        # for the source.
+        assignee_ids = list(IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True))
+        label_ids = list(IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True))
         workspace_id = issue.workspace_id
 
         # Turn the loaded instance into a brand new row. Clearing the primary key and marking the
@@ -898,7 +907,12 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         issue.pk = None
         issue.id = None
         issue._state.adding = True
-        issue.name = f"{issue.name} (Copy)"
+        # The name column is bounded, so the copy suffix is appended to a prefix trimmed to leave
+        # room for it. Without the trim a source name sitting on the column boundary would overflow
+        # the column on insert and surface as a server error instead of a duplicated work item.
+        name_suffix = " (Copy)"
+        name_limit = Issue._meta.get_field("name").max_length - len(name_suffix)
+        issue.name = f"{issue.name[:name_limit]}{name_suffix}"
         # The collaborative editor binary state describes the source document, so it is dropped and
         # the clone re-hydrates from its HTML representation instead.
         issue.description_binary = None
