@@ -68,8 +68,10 @@ from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models import (
     Issue,
     IssueActivity,
+    IssueAssignee,
     FileAsset,
     IssueComment,
+    IssueLabel,
     IssueLink,
     IssueRelation,
     Label,
@@ -839,6 +841,120 @@ class IssueDetailAPIEndpoint(BaseAPIView):
             epoch=int(timezone.now().timestamp()),
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class IssueDuplicateAPIEndpoint(BaseAPIView):
+    """Work Item Duplicate Endpoint"""
+
+    model = Issue
+    webhook_event = "issue"
+    permission_classes = [ProjectEntityPermission]
+    serializer_class = IssueSerializer
+
+    @work_item_docs(
+        operation_id="duplicate_work_item",
+        summary="Duplicate work item",
+        description="Duplicate an existing work item into a new work item in the same project. The clone copies the editable content, assignees and labels of the source, is assigned a fresh sequence id, and starts with a clean history.",  # noqa: E501
+        request=None,
+        responses={
+            201: OpenApiResponse(
+                description="Work Item duplicated successfully",
+                response=IssueSerializer,
+                examples=[ISSUE_EXAMPLE],
+            ),
+            404: WORK_ITEM_NOT_FOUND_RESPONSE,
+        },
+    )
+    def post(self, request, slug, project_id, pk):
+        """Duplicate work item
+
+        Duplicate an existing work item into a new work item in the same project.
+        The clone copies the editable content, assignees and labels of the source, is assigned a
+        fresh sequence id, and starts with a clean history: comments, attachments, activity,
+        relations, reactions, subscribers, votes and cycle or module memberships are deliberately
+        not carried over.
+        """
+        # Resolve the source work item scoped to the workspace slug and the project together, so a
+        # work item addressed through the wrong project or workspace is never readable across
+        # tenants. The lookup is intentionally unguarded because `BaseAPIView.handle_exception`
+        # already maps a missing object onto a 404 response. The default manager is used instead of
+        # `Issue.issue_objects` so that archived and draft work items remain duplicable, while soft
+        # deleted rows still resolve to a 404 through the soft deletion manager.
+        issue = Issue.objects.get(workspace__slug=slug, project_id=project_id, pk=pk)
+
+        # Capture the many-to-many membership and the workspace before the instance is mutated
+        # below. Once the primary key is cleared these managers resolve against an empty key and
+        # silently return empty lists, so this ordering is load bearing.
+        assignee_ids = list(issue.assignees.values_list("id", flat=True))
+        label_ids = list(issue.labels.values_list("id", flat=True))
+        workspace_id = issue.workspace_id
+
+        # Turn the loaded instance into a brand new row. Clearing the primary key and marking the
+        # instance as being added is what makes `Issue.save()` take its insert branch, the only
+        # branch that assigns a fresh sequence id and writes the matching issue sequence row.
+        # Everything not touched below (both description representations, priority, state, point,
+        # estimate point, start and target dates, parent and type) is carried over verbatim by the
+        # instance itself, which is why no copied field is enumerated here.
+        issue.pk = None
+        issue.id = None
+        issue._state.adding = True
+        issue.name = f"{issue.name} (Copy)"
+        # The collaborative editor binary state describes the source document, so it is dropped and
+        # the clone re-hydrates from its HTML representation instead.
+        issue.description_binary = None
+        # The clone is a new native work item rather than a mirror of an external record. Copying
+        # the external identity would leave two rows claiming it and make the create endpoint's
+        # external identity conflict resolution nondeterministic.
+        issue.external_source = None
+        issue.external_id = None
+        # A duplicate always starts un-archived and out of draft, whatever the source looked like.
+        issue.archived_at = None
+        issue.is_draft = False
+        issue.save()
+
+        # The instance clone copies column values only and carries no through rows, so both
+        # many-to-many relationships are re-created explicitly. `bulk_create` bypasses `save()`,
+        # which is what normally derives the workspace from the project, hence the explicit project
+        # and workspace ids. This has to happen before the response is rendered because the
+        # serializer re-queries both through tables at render time.
+        if assignee_ids:
+            IssueAssignee.objects.bulk_create(
+                [
+                    IssueAssignee(
+                        assignee_id=assignee_id,
+                        issue=issue,
+                        project_id=project_id,
+                        workspace_id=workspace_id,
+                    )
+                    for assignee_id in assignee_ids
+                ],
+                batch_size=10,
+            )
+
+        if label_ids:
+            IssueLabel.objects.bulk_create(
+                [
+                    IssueLabel(
+                        label_id=label_id,
+                        issue=issue,
+                        project_id=project_id,
+                        workspace_id=workspace_id,
+                    )
+                    for label_id in label_ids
+                ],
+                batch_size=10,
+            )
+
+        # The clone copies the source state and the model synchronises `completed_at` with the state
+        # group on every insert, so duplicating a completed work item would stamp the clone as
+        # completed too. A queryset update is the only way to clear it because it bypasses `save()`,
+        # and mirroring the value in memory keeps the rendered response consistent without a
+        # second read.
+        if issue.completed_at is not None:
+            Issue.objects.filter(pk=issue.pk).update(completed_at=None)
+            issue.completed_at = None
+
+        return Response(IssueSerializer(issue).data, status=status.HTTP_201_CREATED)
 
 
 class LabelListCreateAPIEndpoint(BaseAPIView):
