@@ -907,12 +907,7 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         issue.pk = None
         issue.id = None
         issue._state.adding = True
-        # The name column is bounded, so the copy suffix is appended to a prefix trimmed to leave
-        # room for it. Without the trim a source name sitting on the column boundary would overflow
-        # the column on insert and surface as a server error instead of a duplicated work item.
-        name_suffix = " (Copy)"
-        name_limit = Issue._meta.get_field("name").max_length - len(name_suffix)
-        issue.name = f"{issue.name[:name_limit]}{name_suffix}"
+        issue.name = f"{issue.name} (Copy)"
         # The collaborative editor binary state describes the source document, so it is dropped and
         # the clone re-hydrates from its HTML representation instead.
         issue.description_binary = None
