@@ -39,13 +39,19 @@ def project(db, workspace, create_user):
 
 @pytest.fixture
 def source_issue(db, project, create_user):
-    """Create the work item to duplicate, carrying a priority, one assignee, one label and a completed state.
+    """Create the work item to duplicate, carrying a priority, an assignee, a label, a completed state and history.
 
     ``completed_at`` is never written by hand. The work item is attached to a state whose group is
     ``completed`` so the model's own ``_sync_completed_at`` populates the column during ``save()``,
     which is the only way a real work item ever acquires that value. That makes the clone's
     ``completed_at`` assertions meaningful: the duplicate endpoint copies the state, so the column
     would be repopulated on insert unless the endpoint explicitly normalizes it afterwards.
+
+    The source is given one comment and one activity for the same reason. Creating a work item
+    through the ORM writes nothing to either history table, so a source with an empty history would
+    let the clone's zero-count assertions hold even for an endpoint that copied every history row it
+    found. Seeding the source is what turns those two counts into evidence that the clone genuinely
+    starts with a clean history rather than merely inheriting an empty one.
     """
     completed_state = State.objects.create(
         name="Completed State",
@@ -82,6 +88,31 @@ def source_issue(db, project, create_user):
     IssueLabel.objects.create(
         issue=issue,
         label=label,
+        project=project,
+        workspace=project.workspace,
+        created_by=create_user,
+    )
+    # One comment on the source. ``IssueComment.save()`` creates the paired ``Description`` row, so
+    # this is a fully formed history row rather than a bare insert.
+    IssueComment.objects.create(
+        issue=issue,
+        comment_html="<p>A comment on the work item being duplicated</p>",
+        comment_json={"type": "doc", "content": [{"type": "paragraph", "text": "A comment"}]},
+        actor=create_user,
+        project=project,
+        workspace=project.workspace,
+        created_by=create_user,
+        updated_by=create_user,
+    )
+    # One activity on the source, shaped like the row the activity task writes when a work item is
+    # created. ``epoch`` is taken from the work item's own creation stamp so the activity clock
+    # matches the row it describes, exactly as that task re-stamps the activity it produces.
+    IssueActivity.objects.create(
+        issue=issue,
+        verb="created",
+        comment="created the work item",
+        actor=create_user,
+        epoch=issue.created_at.timestamp(),
         project=project,
         workspace=project.workspace,
         created_by=create_user,
@@ -139,6 +170,7 @@ class TestWorkItemDuplicate:
         assert duplicated_issue.completed_at is None
 
         # The clone starts with a clean history: no comment is copied and no activity is dispatched.
+        # The source carries one of each, so an endpoint that copied history would fail both counts.
         assert IssueComment.objects.filter(issue=duplicated_issue).count() == 0
         assert IssueActivity.objects.filter(issue=duplicated_issue).count() == 0
 
