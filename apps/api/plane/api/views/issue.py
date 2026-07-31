@@ -874,36 +874,19 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         relations, reactions, subscribers, votes and cycle or module memberships are deliberately
         not carried over.
         """
-        # Resolve the source work item scoped to the workspace slug and the project together, so a
-        # work item addressed through the wrong project or workspace is never readable across
-        # tenants. The lookup is intentionally unguarded because `BaseAPIView.handle_exception`
-        # already maps a missing object onto a 404 response. The default manager is used instead of
-        # `Issue.issue_objects` so that archived and draft work items remain duplicable, while soft
-        # deleted rows still resolve to a 404 through the soft deletion manager. The state, the
-        # project and the project's workspace are selected alongside the source because
-        # `Issue.save()` dereferences all three while inserting the clone.
+        # Use the default manager so archived and draft sources remain duplicable; soft-deleted issues stay excluded.
+        # The state, project and project workspace are selected because Issue.save() dereferences all three.
         issue = Issue.objects.select_related("state", "project__workspace").get(
             workspace__slug=slug, project_id=project_id, pk=pk
         )
 
-        # Capture the many-to-many membership and the workspace before the instance is mutated
-        # below. Once the primary key is cleared these queries resolve against an empty key and
-        # silently return empty lists, so this ordering is load bearing. The through tables are read
-        # directly instead of through the `assignees` and `labels` managers because those managers
-        # join the through rows without filtering out the soft deleted ones, which would resurrect
-        # associations already removed from the source and could duplicate an association that was
-        # removed and added back. Reading them here also matches exactly what the serializer renders
-        # for the source.
+        # Capture active through rows before clearing the source pk; afterward they no longer resolve
+        # the source, and direct through-model reads match serializer soft-delete semantics.
         assignee_ids = list(IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True))
         label_ids = list(IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True))
         workspace_id = issue.workspace_id
 
-        # Turn the loaded instance into a brand new row. Clearing the primary key and marking the
-        # instance as being added is what makes `Issue.save()` take its insert branch, the only
-        # branch that assigns a fresh sequence id and writes the matching issue sequence row.
-        # Everything not touched below (both description representations, priority, state, point,
-        # estimate point, start and target dates, parent and type) is carried over verbatim by the
-        # instance itself, which is why no copied field is enumerated here.
+        # Force Issue.save() down its insert path so it assigns a fresh sequence and IssueSequence row.
         issue.pk = None
         issue.id = None
         issue._state.adding = True
@@ -916,16 +899,12 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         # external identity conflict resolution nondeterministic.
         issue.external_source = None
         issue.external_id = None
-        # A duplicate always starts un-archived and out of draft, whatever the source looked like.
         issue.archived_at = None
         issue.is_draft = False
         issue.save()
 
-        # The instance clone copies column values only and carries no through rows, so both
-        # many-to-many relationships are re-created explicitly. `bulk_create` bypasses `save()`,
-        # which is what normally derives the workspace from the project, hence the explicit project
-        # and workspace ids. This has to happen before the response is rendered because the
-        # serializer re-queries both through tables at render time.
+        # Recreate through rows explicitly. bulk_create bypasses ProjectBaseModel.save(), so project
+        # and workspace must be supplied before serialization re-queries the memberships.
         if assignee_ids:
             IssueAssignee.objects.bulk_create(
                 [
@@ -954,11 +933,8 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
                 batch_size=10,
             )
 
-        # The clone copies the source state and the model synchronises `completed_at` with the state
-        # group on every insert, so duplicating a completed work item would stamp the clone as
-        # completed too. A queryset update is the only way to clear it because it bypasses `save()`,
-        # and mirroring the value in memory keeps the rendered response consistent without a
-        # second read.
+        # Issue.save() repopulates completed_at from a completed state on insert. Bypass that sync
+        # with a queryset update, then mirror the null in memory for serialization.
         if issue.completed_at is not None:
             Issue.objects.filter(pk=issue.pk).update(completed_at=None)
             issue.completed_at = None
