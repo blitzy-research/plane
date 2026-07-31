@@ -18,6 +18,7 @@ from plane.api.views import (
     WorkspaceIssueAPIEndpoint,
     IssueSearchEndpoint,
     IssueRelationListCreateAPIEndpoint,
+    IssueDuplicateAPIEndpoint,
 )
 
 # Deprecated url patterns
@@ -105,6 +106,11 @@ new_url_patterns = [
         "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/<uuid:pk>/",
         IssueDetailAPIEndpoint.as_view(http_method_names=["get", "patch", "delete"]),
         name="work-item-detail",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/<uuid:pk>/duplicate/",
+        IssueDuplicateAPIEndpoint.as_view(http_method_names=["post"]),
+        name="work-item-duplicate",
     ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/<uuid:issue_id>/links/",
