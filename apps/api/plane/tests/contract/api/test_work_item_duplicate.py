@@ -39,19 +39,9 @@ def project(db, workspace, create_user):
 
 @pytest.fixture
 def source_issue(db, project, create_user):
-    """Create the work item to duplicate, carrying a priority, an assignee, a label, a completed state and history.
+    """Create a completed source issue with priority, assignee, label, comment, and activity history.
 
-    ``completed_at`` is never written by hand. The work item is attached to a state whose group is
-    ``completed`` so the model's own ``_sync_completed_at`` populates the column during ``save()``,
-    which is the only way a real work item ever acquires that value. That makes the clone's
-    ``completed_at`` assertions meaningful: the duplicate endpoint copies the state, so the column
-    would be repopulated on insert unless the endpoint explicitly normalizes it afterwards.
-
-    The source is given one comment and one activity for the same reason. Creating a work item
-    through the ORM writes nothing to either history table, so a source with an empty history would
-    let the clone's zero-count assertions hold even for an endpoint that copied every history row it
-    found. Seeding the source is what turns those two counts into evidence that the clone genuinely
-    starts with a clean history rather than merely inheriting an empty one.
+    The completed state and populated history make normalization and clean-history assertions non-vacuous.
     """
     completed_state = State.objects.create(
         name="Completed State",
@@ -92,8 +82,6 @@ def source_issue(db, project, create_user):
         workspace=project.workspace,
         created_by=create_user,
     )
-    # One comment on the source. ``IssueComment.save()`` creates the paired ``Description`` row, so
-    # this is a fully formed history row rather than a bare insert.
     IssueComment.objects.create(
         issue=issue,
         comment_html="<p>A comment on the work item being duplicated</p>",
@@ -104,9 +92,6 @@ def source_issue(db, project, create_user):
         created_by=create_user,
         updated_by=create_user,
     )
-    # One activity on the source, shaped like the row the activity task writes when a work item is
-    # created. ``epoch`` is taken from the work item's own creation stamp so the activity clock
-    # matches the row it describes, exactly as that task re-stamps the activity it produces.
     IssueActivity.objects.create(
         issue=issue,
         verb="created",
@@ -117,29 +102,21 @@ def source_issue(db, project, create_user):
         workspace=project.workspace,
         created_by=create_user,
     )
-    # Reload so the synchronizer populated ``completed_at`` and the save assigned ``sequence_id``
-    # are visible to the assertions that compare the clone against this source.
+    # Reload the persisted, model-normalized source values used by the response comparisons.
     issue.refresh_from_db()
     return issue
 
 
 @pytest.mark.contract
 class TestWorkItemDuplicate:
-    """Test Work Item Duplicate API Endpoint"""
-
     def get_duplicate_url(self, workspace_slug, project_id, pk):
-        """Helper to get the work item duplicate endpoint URL"""
         return f"/api/v1/workspaces/{workspace_slug}/projects/{project_id}/work-items/{pk}/duplicate/"
 
     @pytest.mark.django_db
     def test_duplicate_work_item_success(self, api_key_client, workspace, project, source_issue):
-        """Test successful work item duplication"""
         url = self.get_duplicate_url(workspace.slug, project.id, source_issue.id)
 
-        # Derive the expected many-to-many payloads by reading the through tables exactly as the
-        # serializer renders them, so no identifier is hard coded. The fixture creates one row of
-        # each, so both lists are non-empty and the equality assertions below cannot pass vacuously.
-        # The endpoint never touches the source's rows, so these values stay valid across the call.
+        # Seeded through rows ensure these comparisons cannot pass on empty source memberships.
         expected_assignees = sorted(
             str(assignee_id)
             for assignee_id in IssueAssignee.objects.filter(issue=source_issue).values_list("assignee_id", flat=True)
@@ -153,9 +130,7 @@ class TestWorkItemDuplicate:
 
         assert response.status_code == status.HTTP_201_CREATED
 
-        # ``id`` is rendered by a PrimaryKeyRelatedField and arrives as a UUID object, while the
-        # many-to-many sets are injected as strings. Both sides of every identifier comparison are
-        # stringified so the assertions hold regardless of how the field is rendered.
+        # Normalize serializer and model identifier types before comparing them.
         assert str(response.data["id"]) != str(source_issue.id)
         assert str(response.data["sequence_id"]) != str(source_issue.sequence_id)
         assert response.data["name"].endswith(" (Copy)")
@@ -169,14 +144,12 @@ class TestWorkItemDuplicate:
         duplicated_issue = Issue.objects.get(pk=response.data["id"])
         assert duplicated_issue.completed_at is None
 
-        # The clone starts with a clean history: no comment is copied and no activity is dispatched.
-        # The source carries one of each, so an endpoint that copied history would fail both counts.
+        # Populated source history makes zero clone counts prove comments and activity rows were not copied.
         assert IssueComment.objects.filter(issue=duplicated_issue).count() == 0
         assert IssueActivity.objects.filter(issue=duplicated_issue).count() == 0
 
     @pytest.mark.django_db
     def test_duplicate_work_item_not_found(self, api_key_client, workspace, project):
-        """Test duplicating a non-existent work item"""
         fake_id = uuid4()
         url = self.get_duplicate_url(workspace.slug, project.id, fake_id)
 

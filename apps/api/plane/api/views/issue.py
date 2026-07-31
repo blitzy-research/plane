@@ -844,7 +844,7 @@ class IssueDetailAPIEndpoint(BaseAPIView):
 
 
 class IssueDuplicateAPIEndpoint(BaseAPIView):
-    """Work Item Duplicate Endpoint"""
+    """Provides `duplicate` on work item level, cloning a source into a new work item in the same project"""
 
     model = Issue
     webhook_event = "issue"
@@ -890,9 +890,7 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         issue.pk = None
         issue.id = None
         issue._state.adding = True
-        # Issue.name is a bounded column, unlike the unbounded page name the precedent mutates, so the
-        # copied base name is trimmed to keep the suffix inside the column limit. The limit is read
-        # from the field itself, so the insert can never overflow it and the suffix always survives.
+        # Reserve space for the copy suffix so a maximum-length issue name remains valid.
         name_suffix = " (Copy)"
         name_max_length = Issue._meta.get_field("name").max_length
         issue.name = f"{issue.name[: name_max_length - len(name_suffix)]}{name_suffix}"
