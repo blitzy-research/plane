@@ -68,8 +68,10 @@ from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models import (
     Issue,
     IssueActivity,
+    IssueAssignee,
     FileAsset,
     IssueComment,
+    IssueLabel,
     IssueLink,
     IssueRelation,
     Label,
@@ -839,6 +841,108 @@ class IssueDetailAPIEndpoint(BaseAPIView):
             epoch=int(timezone.now().timestamp()),
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class IssueDuplicateAPIEndpoint(BaseAPIView):
+    """Provides `duplicate` on work item level, cloning a source into a new work item in the same project"""
+
+    model = Issue
+    webhook_event = "issue"
+    permission_classes = [ProjectEntityPermission]
+    serializer_class = IssueSerializer
+
+    @work_item_docs(
+        operation_id="duplicate_work_item",
+        summary="Duplicate work item",
+        description="Duplicate an existing work item into a new work item in the same project. The clone copies the editable content, assignees and labels of the source, is assigned a fresh sequence id, and starts with a clean history.",  # noqa: E501
+        request=None,
+        responses={
+            201: OpenApiResponse(
+                description="Work Item duplicated successfully",
+                response=IssueSerializer,
+                examples=[ISSUE_EXAMPLE],
+            ),
+            404: WORK_ITEM_NOT_FOUND_RESPONSE,
+        },
+    )
+    def post(self, request, slug, project_id, pk):
+        """Duplicate work item
+
+        Duplicate an existing work item into a new work item in the same project.
+        The clone copies the editable content, assignees and labels of the source, is assigned a
+        fresh sequence id, and starts with a clean history: comments, attachments, activity,
+        relations, reactions, subscribers, votes and cycle or module memberships are deliberately
+        not carried over.
+        """
+        # Use the default manager so archived and draft sources remain duplicable; soft-deleted issues stay excluded.
+        # The state, project and project workspace are selected because Issue.save() dereferences all three.
+        issue = Issue.objects.select_related("state", "project__workspace").get(
+            workspace__slug=slug, project_id=project_id, pk=pk
+        )
+
+        # Capture active through rows before clearing the source pk; afterward they no longer resolve
+        # the source, and direct through-model reads match serializer soft-delete semantics.
+        assignee_ids = list(IssueAssignee.objects.filter(issue=issue).values_list("assignee_id", flat=True))
+        label_ids = list(IssueLabel.objects.filter(issue=issue).values_list("label_id", flat=True))
+        workspace_id = issue.workspace_id
+
+        # Force Issue.save() down its insert path so it assigns a fresh sequence and IssueSequence row.
+        issue.pk = None
+        issue.id = None
+        issue._state.adding = True
+        # Reserve space for the copy suffix so a maximum-length issue name remains valid.
+        name_suffix = " (Copy)"
+        name_max_length = Issue._meta.get_field("name").max_length
+        issue.name = f"{issue.name[: name_max_length - len(name_suffix)]}{name_suffix}"
+        # The collaborative editor binary state describes the source document, so it is dropped and
+        # the clone re-hydrates from its HTML representation instead.
+        issue.description_binary = None
+        # The clone is a new native work item rather than a mirror of an external record. Copying
+        # the external identity would leave two rows claiming it and make the create endpoint's
+        # external identity conflict resolution nondeterministic.
+        issue.external_source = None
+        issue.external_id = None
+        issue.archived_at = None
+        issue.is_draft = False
+        issue.save()
+
+        # Recreate through rows explicitly. bulk_create bypasses ProjectBaseModel.save(), so project
+        # and workspace must be supplied before serialization re-queries the memberships.
+        if assignee_ids:
+            IssueAssignee.objects.bulk_create(
+                [
+                    IssueAssignee(
+                        assignee_id=assignee_id,
+                        issue=issue,
+                        project_id=project_id,
+                        workspace_id=workspace_id,
+                    )
+                    for assignee_id in assignee_ids
+                ],
+                batch_size=10,
+            )
+
+        if label_ids:
+            IssueLabel.objects.bulk_create(
+                [
+                    IssueLabel(
+                        label_id=label_id,
+                        issue=issue,
+                        project_id=project_id,
+                        workspace_id=workspace_id,
+                    )
+                    for label_id in label_ids
+                ],
+                batch_size=10,
+            )
+
+        # Issue.save() repopulates completed_at from a completed state on insert. Bypass that sync
+        # with a queryset update, then mirror the null in memory for serialization.
+        if issue.completed_at is not None:
+            Issue.objects.filter(pk=issue.pk).update(completed_at=None)
+            issue.completed_at = None
+
+        return Response(IssueSerializer(issue).data, status=status.HTTP_201_CREATED)
 
 
 class LabelListCreateAPIEndpoint(BaseAPIView):
