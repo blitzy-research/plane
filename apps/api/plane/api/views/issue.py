@@ -890,7 +890,12 @@ class IssueDuplicateAPIEndpoint(BaseAPIView):
         issue.pk = None
         issue.id = None
         issue._state.adding = True
-        issue.name = f"{issue.name} (Copy)"
+        # Issue.name is a bounded column, unlike the unbounded page name the precedent mutates, so the
+        # copied base name is trimmed to keep the suffix inside the column limit. The limit is read
+        # from the field itself, so the insert can never overflow it and the suffix always survives.
+        name_suffix = " (Copy)"
+        name_max_length = Issue._meta.get_field("name").max_length
+        issue.name = f"{issue.name[: name_max_length - len(name_suffix)]}{name_suffix}"
         # The collaborative editor binary state describes the source document, so it is dropped and
         # the clone re-hydrates from its HTML representation instead.
         issue.description_binary = None
