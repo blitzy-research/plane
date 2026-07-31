@@ -155,3 +155,6 @@ class TestWorkItemDuplicate:
 
         response = api_key_client.post(url)
         assert response.status_code == status.HTTP_404_NOT_FOUND
+        # The unguarded lookup is mapped by BaseAPIView.handle_exception, so the envelope is asserted
+        # alongside the status to pin the documented not-found contract.
+        assert response.data["error"] == "The requested resource does not exist."
